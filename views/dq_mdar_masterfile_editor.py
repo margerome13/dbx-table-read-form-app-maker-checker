@@ -745,9 +745,11 @@ with tab_form:
         st.info("👆 Click 'Connect to Table' to start managing your data.")
 
 with tab_view:
-    st.subheader("📊 Table Data View")
+    st.subheader("📊 Table Data View with Inline Editing")
     
     if st.session_state.table_data is not None:
+        st.info("💡 **Tip:** Click on any cell to edit. Changes are saved when you click 'Save Changes' button below.")
+        
         # Search functionality
         search_term = st.text_input("🔍 Search records:", placeholder="Enter search term...", key="search_table_view")
         
@@ -762,13 +764,79 @@ with tab_view:
             display_data = display_data[mask]
             st.info(f"Found {len(display_data)} records matching '{search_term}'")
         
-        st.dataframe(
+        # Configure column types for data editor
+        column_config = {}
+        
+        # Make timestamp fields read-only
+        if 'created_pht' in display_data.columns:
+            column_config['created_pht'] = st.column_config.TextColumn(
+                "created_pht",
+                disabled=True,
+                help="Auto-generated timestamp (read-only)"
+            )
+        if 'updated_pht' in display_data.columns:
+            column_config['updated_pht'] = st.column_config.TextColumn(
+                "updated_pht",
+                disabled=True,
+                help="Auto-updated timestamp (read-only)"
+            )
+        
+        # Editable data editor
+        edited_data = st.data_editor(
             display_data,
             use_container_width=True,
-            hide_index=True
+            hide_index=True,
+            num_rows="fixed",
+            column_config=column_config,
+            key="data_editor"
         )
         
+        # Save changes button
+        col_save, col_cancel = st.columns([1, 4])
+        with col_save:
+            if st.button("💾 Save Changes", type="primary"):
+                try:
+                    conn = get_connection(DATABRICKS_HOST, HTTP_PATH)
+                    
+                    # Find changed rows
+                    changes_made = False
+                    for idx in edited_data.index:
+                        original_row = display_data.loc[idx]
+                        edited_row = edited_data.loc[idx]
+                        
+                        # Check if row was modified
+                        if not original_row.equals(edited_row):
+                            # Get the ticket for WHERE clause
+                            ticket = original_row['ticket']
+                            
+                            # Validate ticket format
+                            if not validate_ticket_format(str(ticket)):
+                                st.error(f"❌ Invalid ticket format for row with ticket '{ticket}'. Skipping.")
+                                continue
+                            
+                            # Create record data from edited row
+                            record_data = edited_row.to_dict()
+                            
+                            # Create WHERE clause
+                            escaped_ticket = str(ticket).replace("'", "''")
+                            where_clause = f"ticket = '{escaped_ticket}'"
+                            
+                            # Update the record
+                            update_record(TABLE_NAME, record_data, where_clause, conn)
+                            changes_made = True
+                    
+                    if changes_made:
+                        st.success("✅ Changes saved successfully!")
+                        st.session_state.table_data = None  # Force refresh
+                        st.rerun()
+                    else:
+                        st.info("ℹ️ No changes detected.")
+                        
+                except Exception as e:
+                    st.error(f"❌ Error saving changes: {str(e)}")
+        
         # Table statistics
+        st.divider()
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Total Records", len(st.session_state.table_data))
