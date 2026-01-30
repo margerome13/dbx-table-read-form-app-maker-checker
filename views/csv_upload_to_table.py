@@ -34,7 +34,25 @@ def get_connection(server_hostname: str, http_path: str):
 def get_current_user_email() -> str:
     """Get the current user's Databricks email - no caching to ensure fresh data"""
     try:
-        # Method 1: Try SQL query to get current user (most reliable in Databricks Apps)
+        # Method 1: Try to get from Streamlit context (X-Forwarded-Preferred-Username header)
+        # This is the most reliable method in Databricks Apps
+        try:
+            if hasattr(st, 'context') and hasattr(st.context, 'headers'):
+                headers = st.context.headers
+                if headers:
+                    username = headers.get("X-Forwarded-Preferred-Username")
+                    if username and '@' in username:
+                        return username
+        except Exception:
+            pass
+        
+        # Method 2: Try Streamlit's experimental user info
+        if hasattr(st, 'experimental_user') and st.experimental_user:
+            user_email = st.experimental_user.get('email')
+            if user_email and '@' in user_email:
+                return user_email
+        
+        # Method 3: Try SQL query to get current user
         try:
             conn = get_connection(DATABRICKS_HOST, HTTP_PATH)
             with conn.cursor() as cursor:
@@ -45,16 +63,10 @@ def get_current_user_email() -> str:
                     # If it's an email, return it
                     if '@' in str(user_value):
                         return str(user_value)
-        except Exception as sql_error:
+        except Exception:
             pass
         
-        # Method 2: Try Streamlit's experimental user info
-        if hasattr(st, 'experimental_user') and st.experimental_user:
-            user_email = st.experimental_user.get('email')
-            if user_email and '@' in user_email:
-                return user_email
-        
-        # Method 3: Try WorkspaceClient
+        # Method 4: Try WorkspaceClient
         w = WorkspaceClient()
         current_user = w.current_user.me()
         
@@ -155,6 +167,11 @@ def table_exists(table_name: str, conn) -> bool:
     except Exception:
         return False
 
+def drop_table(table_name: str, conn):
+    """Drop a table if it exists"""
+    with conn.cursor() as cursor:
+        cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+
 def create_table_from_dataframe(df: pd.DataFrame, table_name: str, conn):
     """Create Delta table from DataFrame"""
     columns_def = []
@@ -173,44 +190,60 @@ def create_table_from_dataframe(df: pd.DataFrame, table_name: str, conn):
         cursor.execute(create_sql)
 
 def insert_data_to_table(df: pd.DataFrame, table_name: str, conn, mode: str = "append"):
-    """Insert DataFrame data into Delta table"""
+    """Insert DataFrame data into Delta table with batching to avoid parameter limit"""
     rows = list(df.itertuples(index=False, name=None))
     if not rows:
         return
     
     cols = list(df.columns)
-    params = {}
-    values_sql_parts = []
-    p = 0
-    
-    # Build parameterized query
-    for row in rows:
-        ph = []
-        for v in row:
-            key = f"p{p}"
-            ph.append(f":{key}")
-            # Handle None/NaN values
-            if pd.isna(v):
-                params[key] = None
-            else:
-                params[key] = v
-            p += 1
-        values_sql_parts.append("(" + ",".join(ph) + ")")
-    
-    values_sql = ",".join(values_sql_parts)
     col_list_sql = ",".join([f"`{col}`" for col in cols])
     
-    with conn.cursor() as cursor:
-        if mode == "overwrite":
-            cursor.execute(
-                f"INSERT OVERWRITE {table_name} ({col_list_sql}) VALUES {values_sql}",
-                params
-            )
-        else:  # append
-            cursor.execute(
-                f"INSERT INTO {table_name} ({col_list_sql}) VALUES {values_sql}",
-                params
-            )
+    # Databricks SQL has a 256 parameter limit
+    # Calculate batch size: 256 / number_of_columns (with some buffer)
+    max_params = 250  # Use 250 to be safe
+    num_cols = len(cols)
+    batch_size = max(1, max_params // num_cols)
+    
+    # For overwrite mode, we need to handle the first batch specially
+    is_first_batch = True
+    
+    # Process rows in batches
+    for i in range(0, len(rows), batch_size):
+        batch_rows = rows[i:i + batch_size]
+        params = {}
+        values_sql_parts = []
+        p = 0
+        
+        # Build parameterized query for this batch
+        for row in batch_rows:
+            ph = []
+            for v in row:
+                key = f"p{p}"
+                ph.append(f":{key}")
+                # Handle None/NaN values
+                if pd.isna(v):
+                    params[key] = None
+                else:
+                    params[key] = v
+                p += 1
+            values_sql_parts.append("(" + ",".join(ph) + ")")
+        
+        values_sql = ",".join(values_sql_parts)
+        
+        with conn.cursor() as cursor:
+            if mode == "overwrite" and is_first_batch:
+                # First batch in overwrite mode uses INSERT OVERWRITE
+                cursor.execute(
+                    f"INSERT OVERWRITE {table_name} ({col_list_sql}) VALUES {values_sql}",
+                    params
+                )
+                is_first_batch = False
+            else:
+                # Subsequent batches or append mode use INSERT INTO
+                cursor.execute(
+                    f"INSERT INTO {table_name} ({col_list_sql}) VALUES {values_sql}",
+                    params
+                )
 
 # Page header
 st.header(body="CSV Upload to Databricks Table", divider=True)
@@ -286,9 +319,13 @@ with tab_upload:
             with col_right:
                 upload_mode = st.selectbox(
                     "Upload Mode:",
-                    ["Create New Table", "Append to Existing Table", "Overwrite Existing Table"],
+                    ["Create New Table", "Append to Existing Table", "Overwrite Existing Table", "Replace Table (Schema + Data)"],
                     help="Choose how to handle the data"
                 )
+            
+            # Show warning for destructive Replace mode
+            if upload_mode == "Replace Table (Schema + Data)":
+                st.warning("⚠️ **Warning:** This will DROP the existing table and recreate it with the CSV's schema. All existing data and schema will be permanently lost!")
             
             # Additional options
             with st.expander("🔧 Advanced Options"):
@@ -403,7 +440,7 @@ uploaded_by: STRING (user email)
                                 - ✅ Backup: `{volume_path}`
                                 """)
                         
-                        else:  # Overwrite
+                        elif upload_mode == "Overwrite Existing Table":
                             if not table_exists(target_table, conn):
                                 create_table_from_dataframe(df_to_upload, target_table, conn)
                                 st.info(f"ℹ️ Table `{target_table}` created (did not exist)")
@@ -421,6 +458,38 @@ uploaded_by: STRING (user email)
                             st.success(f"""
                             **Upload Summary:**
                             - ✅ {len(df_to_upload)} rows written (overwrite mode)
+                            - ✅ Table: `{target_table}`
+                            - ✅ Backup: `{volume_path}`
+                            """)
+                        
+                        else:  # Replace Table (Schema + Data)
+                            # Step 6: Drop and recreate table
+                            status_text.info("🗑️ Dropping existing table...")
+                            progress_bar.progress(75)
+                            
+                            drop_table(target_table, conn)
+                            st.info(f"ℹ️ Table `{target_table}` dropped")
+                            
+                            status_text.info("🏗️ Creating new table with CSV schema...")
+                            progress_bar.progress(80)
+                            
+                            create_table_from_dataframe(df_to_upload, target_table, conn)
+                            st.success(f"✅ Table `{target_table}` recreated with new schema!")
+                            
+                            # Step 7: Insert data
+                            status_text.info("💾 Inserting data...")
+                            progress_bar.progress(90)
+                            
+                            insert_data_to_table(df_to_upload, target_table, conn, mode="append")
+                            
+                            progress_bar.progress(100)
+                            status_text.success("✅ Upload complete!")
+                            st.balloons()
+                            
+                            st.success(f"""
+                            **Upload Summary:**
+                            - ✅ Table replaced with new schema
+                            - ✅ {len(df_to_upload)} rows inserted
                             - ✅ Table: `{target_table}`
                             - ✅ Backup: `{volume_path}`
                             """)
@@ -514,11 +583,20 @@ with tab_help:
     - Adds new rows to existing data
     - Keeps all existing records
     - Column names must match existing table
+    - Table schema remains unchanged
     
     **Overwrite Existing Table:**
     - Replaces all data in table
-    - Keeps table structure
+    - Keeps table structure/schema
+    - Column names must match existing table
     - Use with caution!
+    
+    **Replace Table (Schema + Data):** ⚠️ DESTRUCTIVE
+    - Drops the existing table completely
+    - Creates a new table with CSV's schema
+    - Inserts all CSV data
+    - Use when CSV has different columns than existing table
+    - **Warning:** All existing data is permanently lost!
     
     ### Integration with Maker-Checker Workflow
     
